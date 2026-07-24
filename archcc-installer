@@ -1,0 +1,1805 @@
+-- ArchCC bootstrap installer
+-- Version 0.1.0
+--
+-- Lua-native Arch-inspired environment for CC:Tweaked/CraftOS-PC.
+-- This does not contain or emulate the Linux kernel.
+
+local VERSION = "0.1.0"
+
+local function mkdirp(path)
+    if not path or path == "" then
+        return
+    end
+
+    local current = ""
+    for part in path:gmatch("[^/]+") do
+        current = fs.combine(current, part)
+
+        if fs.exists(current) and not fs.isDir(current) then
+            error(current .. " exists and is not a directory", 0)
+        end
+
+        if not fs.exists(current) then
+            fs.makeDir(current)
+        end
+    end
+end
+
+local function writeFile(path, contents)
+    mkdirp(fs.getDir(path))
+
+    local handle, reason = fs.open(path, "w")
+    if not handle then
+        error("Could not write " .. path .. ": " .. tostring(reason), 0)
+    end
+
+    handle.write(contents)
+    handle.close()
+end
+
+local function readFile(path)
+    local handle = fs.open(path, "r")
+    if not handle then
+        return nil
+    end
+
+    local contents = handle.readAll()
+    handle.close()
+    return contents
+end
+
+local function sortedKeys(tbl)
+    local result = {}
+
+    for key in pairs(tbl or {}) do
+        result[#result + 1] = key
+    end
+
+    table.sort(result)
+    return result
+end
+
+local function timestamp()
+    if os.epoch then
+        return math.floor(os.epoch("utc") / 1000)
+    end
+
+    return os.day() * 86400 + math.floor(os.time() * 3600)
+end
+
+local function randomHex(length)
+    local result = {}
+
+    math.randomseed(timestamp() + os.getComputerID() * 7919)
+
+    for index = 1, length do
+        result[index] = string.format("%x", math.random(0, 15))
+    end
+
+    return table.concat(result)
+end
+
+local directories = {
+    "boot",
+    "dev",
+    "etc",
+    "etc/pacman.d",
+    "etc/systemd/system",
+    "etc/systemd/system/multi-user.target.wants",
+    "home",
+    "mnt",
+    "opt",
+    "proc",
+    "root",
+    "run",
+    "run/archcc",
+    "run/archcc/services",
+    "srv",
+    "sys",
+    "tmp",
+    "usr",
+    "usr/bin",
+    "usr/lib",
+    "usr/lib/archcc",
+    "usr/lib/systemd",
+    "usr/lib/systemd/system",
+    "usr/local",
+    "usr/local/bin",
+    "var",
+    "var/cache",
+    "var/cache/pacman",
+    "var/cache/pacman/pkg",
+    "var/lib",
+    "var/lib/archcc",
+    "var/lib/archcc/repo",
+    "var/lib/pacman",
+    "var/lib/pacman/local",
+    "var/lib/pacman/sync",
+    "var/log",
+    "var/tmp",
+}
+
+for _, directory in ipairs(directories) do
+    mkdirp(directory)
+end
+
+-- Preserve the previous CraftOS startup entrypoint.
+if fs.exists("startup.lua") and not fs.exists("startup.craftos.bak") then
+    fs.copy("startup.lua", "startup.craftos.bak")
+end
+
+local configFiles = {
+    ["etc/os-release"] = [=[NAME="ArchCC"
+PRETTY_NAME="ArchCC Rolling"
+ID=archcc
+ID_LIKE=arch
+BUILD_ID=rolling
+ANSI_COLOR="38;2;23;147;209"
+HOME_URL="https://archlinux.org/"
+DOCUMENTATION_URL="https://wiki.archlinux.org/"
+LOGO=archlinux-logo
+]=],
+
+    ["etc/arch-release"] = "ArchCC release " .. VERSION .. "\n",
+
+    ["etc/hostname"] = "archcc\n",
+
+    ["etc/hosts"] = [=[127.0.0.1 localhost
+127.0.1.1 archcc.localdomain archcc
+]=],
+
+    ["etc/issue"] = [=[ArchCC 0.1.0 (\l)
+
+]=],
+
+    ["etc/motd"] = [=[
+Welcome to ArchCC.
+
+This is a Lua-native Arch-inspired environment running on CraftOS.
+It is not the Linux kernel, GNU userland, or binary-compatible Arch Linux.
+
+Use "pacman -S fastfetch" to install the first optional package.
+]=],
+
+    ["etc/passwd"] = [=[root:x:0:0:root:/root:/usr/bin/archcc-shell.lua
+nobody:x:65534:65534:Nobody:/:/usr/bin/nologin
+]=],
+
+    ["etc/group"] = [=[root:x:0:root
+wheel:x:10:root
+users:x:985:
+nobody:x:65534:
+]=],
+
+    -- Empty root password for the initial development image.
+    ["etc/shadow"] = [=[root::0:0:99999:7:::
+nobody:!*:0:0:99999:7:::
+]=],
+
+    ["etc/shells"] = [=[/usr/bin/archcc-shell.lua
+]=],
+
+    ["etc/locale.conf"] = "LANG=en_US.UTF-8\n",
+
+    ["etc/vconsole.conf"] = "KEYMAP=us\n",
+
+    ["etc/fstab"] = [=[# Static filesystem information.
+# CraftOS manages its own virtual filesystem and mounted peripherals.
+]=],
+
+    ["etc/pacman.conf"] = [=[#
+# /etc/pacman.conf
+#
+
+[options]
+HoldPkg = pacman archcc-shell
+Architecture = auto
+CheckSpace
+Color
+ParallelDownloads = 1
+SigLevel = Never
+LocalFileSigLevel = Optional
+
+[core]
+Include = /etc/pacman.d/mirrorlist
+]=],
+
+    ["etc/pacman.d/mirrorlist"] = [=[##
+## ArchCC local repository
+##
+
+Server = file:///var/lib/archcc/repo/core
+]=],
+
+    ["var/log/pacman.log"] =
+        "[" .. tostring(timestamp()) ..
+        "] [ALPM] ArchCC package database initialized\n",
+}
+
+for path, contents in pairs(configFiles) do
+    writeFile(path, contents)
+end
+
+writeFile("etc/machine-id", randomHex(32) .. "\n")
+
+-- -------------------------------------------------------------------------
+-- Shell
+-- -------------------------------------------------------------------------
+
+writeFile("usr/bin/archcc-shell.lua", [=[local history = {}
+
+local function readAll(path)
+    local handle = fs.open(path, "r")
+    if not handle then
+        return nil
+    end
+
+    local contents = handle.readAll()
+    handle.close()
+    return contents
+end
+
+local function hostname()
+    local value = readAll("etc/hostname") or "archcc"
+    return value:gsub("%s+$", "")
+end
+
+local function username()
+    local value = readAll("run/archcc/user") or "root"
+    return value:gsub("%s+$", "")
+end
+
+local function displayPath()
+    local current = shell.dir()
+
+    if current == "" then
+        return "/"
+    end
+
+    current = "/" .. current
+
+    local home = username() == "root" and "/root" or "/home/" .. username()
+
+    if current == home then
+        return "~"
+    elseif current:sub(1, #home + 1) == home .. "/" then
+        return "~" .. current:sub(#home + 1)
+    end
+
+    return current
+end
+
+local function configureAliases()
+    local aliases = {
+        ls = "list",
+        dir = "list",
+        cp = "copy",
+        mv = "move",
+        rm = "delete",
+        cat = "type",
+        nano = "edit",
+    }
+
+    for alias, program in pairs(aliases) do
+        if shell.setAlias then
+            shell.setAlias(alias, program)
+        end
+    end
+end
+
+local function drawPrompt()
+    local colour = term.isColor and term.isColor()
+
+    if colour then
+        term.setTextColor(colors.green)
+    end
+
+    write("[" .. username() .. "@" .. hostname() .. " ")
+
+    if colour then
+        term.setTextColor(colors.blue)
+    end
+
+    write(displayPath())
+
+    if colour then
+        term.setTextColor(colors.green)
+    end
+
+    write("]")
+
+    if colour then
+        term.setTextColor(colors.white)
+    end
+
+    if username() == "root" then
+        write("# ")
+    else
+        write("$ ")
+    end
+end
+
+shell.setPath(
+    "usr/local/bin:usr/bin:bin:" ..
+    "/rom/programs:/rom/programs/http:/rom/programs/fun"
+)
+
+configureAliases()
+
+if username() == "root" then
+    shell.setDir("root")
+else
+    local home = "home/" .. username()
+    if not fs.exists(home) then
+        fs.makeDir(home)
+    end
+    shell.setDir(home)
+end
+
+local motd = readAll("etc/motd")
+if motd then
+    print(motd)
+end
+
+while true do
+    drawPrompt()
+
+    local line
+
+    if shell.complete then
+        line = read(nil, history, shell.complete)
+    else
+        line = read(nil, history)
+    end
+
+    line = line or ""
+    line = line:match("^%s*(.-)%s*$")
+
+    if line ~= "" then
+        history[#history + 1] = line
+
+        if #history > 100 then
+            table.remove(history, 1)
+        end
+
+        if line == "exit" or line == "logout" then
+            return
+        elseif line == "pwd" then
+            print("/" .. shell.dir())
+        elseif line:match("^export%s+") then
+            printError("archcc-shell: persistent environment variables are not implemented yet")
+        else
+            shell.run(line)
+        end
+    end
+end
+]=])
+
+-- -------------------------------------------------------------------------
+-- Login/getty
+-- -------------------------------------------------------------------------
+
+writeFile("usr/bin/login.lua", [=[local function readAll(path)
+    local handle = fs.open(path, "r")
+    if not handle then
+        return nil
+    end
+
+    local contents = handle.readAll()
+    handle.close()
+    return contents
+end
+
+local function writeAll(path, contents)
+    local handle = assert(fs.open(path, "w"))
+    handle.write(contents)
+    handle.close()
+end
+
+local hostname = (readAll("etc/hostname") or "archcc"):gsub("%s+$", "")
+
+term.clear()
+term.setCursorPos(1, 1)
+
+print("ArchCC 0.1.0 (tty1)")
+print("")
+
+while true do
+    write(hostname .. " login: ")
+    local user = read()
+
+    if user == "root" then
+        write("Password: ")
+        local password = read("*")
+
+        if password == "" then
+            writeAll("run/archcc/user", "root\n")
+            print("")
+
+            shell.run("usr/bin/archcc-shell.lua")
+
+            if fs.exists("run/archcc/user") then
+                fs.delete("run/archcc/user")
+            end
+
+            term.clear()
+            term.setCursorPos(1, 1)
+            print("ArchCC 0.1.0 (tty1)")
+            print("")
+        else
+            sleep(1)
+            print("")
+            print("Login incorrect")
+            print("")
+        end
+    else
+        sleep(1)
+        print("Login incorrect")
+        print("")
+    end
+end
+]=])
+
+-- -------------------------------------------------------------------------
+-- Init
+-- -------------------------------------------------------------------------
+
+writeFile("usr/lib/archcc/init.lua", [=[local function status(message)
+    local colour = term.isColor and term.isColor()
+
+    write("[")
+
+    if colour then
+        term.setTextColor(colors.green)
+    end
+
+    write("  OK  ")
+
+    if colour then
+        term.setTextColor(colors.white)
+    end
+
+    print("] " .. message)
+end
+
+local function writeAll(path, contents)
+    local handle = assert(fs.open(path, "w"))
+    handle.write(contents)
+    handle.close()
+end
+
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)
+
+print("ArchCC " .. "0.1.0")
+print("Lua-native userspace for CC:Tweaked")
+print("")
+
+shell.setPath(
+    "usr/local/bin:usr/bin:bin:" ..
+    "/rom/programs:/rom/programs/http:/rom/programs/fun"
+)
+
+status("Mounted CraftOS virtual root filesystem.")
+status("Started ArchCC Runtime Environment.")
+status("Reached target Local File Systems.")
+status("Reached target Multi-User System.")
+status("Started Getty on tty1.")
+
+writeAll("run/archcc/system-state", "running\n")
+writeAll("run/archcc/target", "multi-user.target\n")
+
+sleep(0.3)
+
+while true do
+    local ok = shell.run("usr/bin/login.lua")
+
+    if not ok then
+        printError("ArchCC getty failed.")
+        print("Starting CraftOS recovery shell.")
+        return
+    end
+end
+]=])
+
+-- -------------------------------------------------------------------------
+-- uname
+-- -------------------------------------------------------------------------
+
+writeFile("usr/bin/uname.lua", [=[local args = { ... }
+
+local function readAll(path)
+    local handle = fs.open(path, "r")
+    if not handle then
+        return nil
+    end
+
+    local contents = handle.readAll()
+    handle.close()
+    return contents:gsub("%s+$", "")
+end
+
+local systemName = "ArchCC"
+local nodeName = readAll("etc/hostname") or "archcc"
+local release = "0.1.0-archcc1"
+local version = "#1 Lua-native"
+local machine = "cc-lua"
+local operatingSystem = "ArchCC"
+
+if #args == 0 then
+    print(systemName)
+    return
+end
+
+local output = {}
+
+local function add(value)
+    output[#output + 1] = value
+end
+
+for _, arg in ipairs(args) do
+    if arg == "-a" or arg == "--all" then
+        output = {
+            systemName,
+            nodeName,
+            release,
+            version,
+            machine,
+            operatingSystem,
+        }
+        break
+    elseif arg == "-s" or arg == "--kernel-name" then
+        add(systemName)
+    elseif arg == "-n" or arg == "--nodename" then
+        add(nodeName)
+    elseif arg == "-r" or arg == "--kernel-release" then
+        add(release)
+    elseif arg == "-v" or arg == "--kernel-version" then
+        add(version)
+    elseif arg == "-m" or arg == "--machine" then
+        add(machine)
+    elseif arg == "-o" or arg == "--operating-system" then
+        add(operatingSystem)
+    else
+        printError("uname: invalid option -- '" .. arg .. "'")
+        return
+    end
+end
+
+print(table.concat(output, " "))
+]=])
+
+-- -------------------------------------------------------------------------
+-- hostname and identity commands
+-- -------------------------------------------------------------------------
+
+writeFile("usr/bin/hostname.lua", [=[local args = { ... }
+
+local function readAll(path)
+    local handle = fs.open(path, "r")
+    if not handle then
+        return nil
+    end
+
+    local contents = handle.readAll()
+    handle.close()
+    return contents:gsub("%s+$", "")
+end
+
+if #args == 0 then
+    print(readAll("etc/hostname") or "archcc")
+    return
+end
+
+local name = args[1]
+
+if not name:match("^[%w%-%.]+$") then
+    printError("hostname: invalid hostname")
+    return
+end
+
+local handle = assert(fs.open("etc/hostname", "w"))
+handle.write(name .. "\n")
+handle.close()
+
+print(name)
+]=])
+
+writeFile("usr/bin/whoami.lua", [=[local handle = fs.open("run/archcc/user", "r")
+
+if not handle then
+    print("root")
+    return
+end
+
+local user = handle.readAll():gsub("%s+$", "")
+handle.close()
+
+print(user)
+]=])
+
+writeFile("usr/bin/id.lua", [=[local handle = fs.open("run/archcc/user", "r")
+local user = "root"
+
+if handle then
+    user = handle.readAll():gsub("%s+$", "")
+    handle.close()
+end
+
+if user == "root" then
+    print("uid=0(root) gid=0(root) groups=0(root),10(wheel)")
+else
+    print("uid=1000(" .. user .. ") gid=985(users) groups=985(users)")
+end
+]=])
+
+writeFile("usr/bin/reboot.lua", [=[print("Rebooting.")
+sleep(0.2)
+os.reboot()
+]=])
+
+writeFile("usr/bin/poweroff.lua", [=[print("Powering off.")
+sleep(0.2)
+os.shutdown()
+]=])
+
+writeFile("usr/bin/shutdown.lua", [=[local args = { ... }
+
+for _, arg in ipairs(args) do
+    if arg == "-r" or arg == "--reboot" then
+        print("Rebooting.")
+        sleep(0.2)
+        os.reboot()
+    end
+end
+
+print("Powering off.")
+sleep(0.2)
+os.shutdown()
+]=])
+
+-- -------------------------------------------------------------------------
+-- systemctl compatibility layer
+-- -------------------------------------------------------------------------
+
+writeFile("usr/bin/systemctl.lua", [=[local args = { ... }
+local unpackValues = table.unpack or unpack
+
+local SYSTEM_DIRS = {
+    "etc/systemd/system",
+    "usr/lib/systemd/system",
+}
+
+local WANTS_DIR = "etc/systemd/system/multi-user.target.wants"
+local RUN_DIR = "run/archcc/services"
+
+local function mkdirp(path)
+    local current = ""
+
+    for part in path:gmatch("[^/]+") do
+        current = fs.combine(current, part)
+
+        if not fs.exists(current) then
+            fs.makeDir(current)
+        end
+    end
+end
+
+local function writeFile(path, contents)
+    mkdirp(fs.getDir(path))
+
+    local handle = assert(fs.open(path, "w"))
+    handle.write(contents)
+    handle.close()
+end
+
+local function findUnit(name)
+    for _, directory in ipairs(SYSTEM_DIRS) do
+        local path = fs.combine(directory, name)
+
+        if fs.exists(path) and not fs.isDir(path) then
+            return path
+        end
+    end
+
+    return nil
+end
+
+local function parseUnit(name)
+    local path = findUnit(name)
+    if not path then
+        return nil
+    end
+
+    local unit = {
+        path = path,
+        values = {},
+    }
+
+    local section = ""
+    local handle = fs.open(path, "r")
+
+    while true do
+        local line = handle.readLine()
+        if not line then
+            break
+        end
+
+        line = line:match("^%s*(.-)%s*$")
+
+        local newSection = line:match("^%[(.-)%]$")
+        if newSection then
+            section = newSection
+            unit.values[section] = unit.values[section] or {}
+        elseif line ~= "" and line:sub(1, 1) ~= "#" then
+            local key, value = line:match("^([^=]+)=(.*)$")
+
+            if key then
+                unit.values[section] = unit.values[section] or {}
+                unit.values[section][key] = value
+            end
+        end
+    end
+
+    handle.close()
+    return unit
+end
+
+local function description(unit)
+    if unit and unit.values.Unit then
+        return unit.values.Unit.Description or "ArchCC unit"
+    end
+
+    return "ArchCC unit"
+end
+
+local function enabled(name)
+    return fs.exists(fs.combine(WANTS_DIR, name))
+end
+
+local function active(name)
+    if name == "multi-user.target" or name == "getty@tty1.service" then
+        return true
+    end
+
+    return fs.exists(fs.combine(RUN_DIR, name))
+end
+
+local function status(name)
+    local unit = parseUnit(name)
+
+    if not unit then
+        printError("Unit " .. name .. " could not be found.")
+        return false
+    end
+
+    local isActive = active(name)
+
+    write("● " .. name .. " - " .. description(unit) .. "\n")
+    print("     Loaded: loaded (/" .. unit.path .. "; " ..
+        (enabled(name) and "enabled" or "disabled") .. ")")
+    print("     Active: " ..
+        (isActive and "active (running)" or "inactive (dead)"))
+
+    return isActive
+end
+
+local function listUnitFiles()
+    local found = {}
+
+    for _, directory in ipairs(SYSTEM_DIRS) do
+        if fs.exists(directory) then
+            for _, name in ipairs(fs.list(directory)) do
+                if name:match("%.service$") or name:match("%.target$") then
+                    found[name] = true
+                end
+            end
+        end
+    end
+
+    local names = {}
+    for name in pairs(found) do
+        names[#names + 1] = name
+    end
+    table.sort(names)
+
+    print("UNIT FILE                  STATE")
+
+    for _, name in ipairs(names) do
+        print(string.format(
+            "%-26s %s",
+            name,
+            enabled(name) and "enabled" or "disabled"
+        ))
+    end
+
+    print("")
+    print(tostring(#names) .. " unit files listed.")
+end
+
+local command = args[1]
+
+if not command then
+    print("systemctl [COMMAND] [UNIT]")
+    return
+end
+
+if command == "status" then
+    status(args[2] or "multi-user.target")
+
+elseif command == "is-active" then
+    local name = args[2]
+
+    if name and active(name) then
+        print("active")
+    else
+        print("inactive")
+    end
+
+elseif command == "is-enabled" then
+    local name = args[2]
+
+    if name and enabled(name) then
+        print("enabled")
+    else
+        print("disabled")
+    end
+
+elseif command == "enable" then
+    local name = args[2]
+    local unit = name and parseUnit(name)
+
+    if not unit then
+        printError("Unit " .. tostring(name) .. " could not be found.")
+        return
+    end
+
+    mkdirp(WANTS_DIR)
+    writeFile(fs.combine(WANTS_DIR, name), unit.path .. "\n")
+
+    print("Created enablement record /" ..
+        fs.combine(WANTS_DIR, name) .. ".")
+
+elseif command == "disable" then
+    local name = args[2]
+    local path = name and fs.combine(WANTS_DIR, name)
+
+    if path and fs.exists(path) then
+        fs.delete(path)
+    end
+
+    print("Removed enablement record for " .. tostring(name) .. ".")
+
+elseif command == "start" then
+    local name = args[2]
+    local unit = name and parseUnit(name)
+
+    if not unit then
+        printError("Unit " .. tostring(name) .. " could not be found.")
+        return
+    end
+
+    if active(name) then
+        return
+    end
+
+    local service = unit.values.Service or {}
+    local commandLine = service.ExecStart
+
+    if not commandLine then
+        printError("Unit " .. name .. " has no ExecStart.")
+        return
+    end
+
+    local words
+
+    if textutils.tokenise then
+        words = textutils.tokenise(commandLine)
+    else
+        words = {}
+        for word in commandLine:gmatch("%S+") do
+            words[#words + 1] = word
+        end
+    end
+
+    local program = table.remove(words, 1)
+
+    if shell.openTab then
+        local tab = shell.openTab(program, unpackValues(words))
+        writeFile(fs.combine(RUN_DIR, name), tostring(tab) .. "\n")
+    else
+        printError("Background services require multishell support.")
+    end
+
+elseif command == "stop" then
+    local name = args[2]
+    local statePath = name and fs.combine(RUN_DIR, name)
+
+    if statePath and fs.exists(statePath) then
+        os.queueEvent("archcc_service_stop", name)
+        fs.delete(statePath)
+        print("Stop requested for " .. name .. ".")
+    end
+
+elseif command == "restart" then
+    printError("systemctl: restart is not implemented in ArchCC 0.1")
+
+elseif command == "daemon-reload" then
+    print("ArchCC unit configuration reloaded.")
+
+elseif command == "list-unit-files" then
+    listUnitFiles()
+
+elseif command == "get-default" then
+    print("multi-user.target")
+
+else
+    printError("systemctl: unknown command: " .. tostring(command))
+end
+]=])
+
+writeFile("usr/lib/systemd/system/multi-user.target", [=[[Unit]
+Description=Multi-User System
+Requires=getty@tty1.service
+After=basic.target
+]=])
+
+writeFile("usr/lib/systemd/system/getty@tty1.service", [=[[Unit]
+Description=Getty on tty1
+After=multi-user.target
+
+[Service]
+Type=idle
+ExecStart=/usr/bin/login.lua
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+]=])
+
+-- -------------------------------------------------------------------------
+-- pacman
+-- -------------------------------------------------------------------------
+
+writeFile("usr/bin/pacman.lua", [=[local args = { ... }
+
+local LOCAL_DB = "var/lib/pacman/local"
+local SYNC_DB = "var/lib/pacman/sync/core.db"
+local LOG_FILE = "var/log/pacman.log"
+
+local protectedPackages = {
+    base = true,
+    filesystem = true,
+    pacman = true,
+    ["archcc-release"] = true,
+    ["archcc-shell"] = true,
+}
+
+local function mkdirp(path)
+    if path == "" then
+        return
+    end
+
+    local current = ""
+
+    for part in path:gmatch("[^/]+") do
+        current = fs.combine(current, part)
+
+        if not fs.exists(current) then
+            fs.makeDir(current)
+        end
+    end
+end
+
+local function readFile(path)
+    local handle = fs.open(path, "r")
+    if not handle then
+        return nil
+    end
+
+    local contents = handle.readAll()
+    handle.close()
+    return contents
+end
+
+local function writeFile(path, contents)
+    mkdirp(fs.getDir(path))
+
+    local handle, reason = fs.open(path, "w")
+    if not handle then
+        error("could not write " .. path .. ": " .. tostring(reason), 0)
+    end
+
+    handle.write(contents)
+    handle.close()
+end
+
+local function appendLog(message)
+    local previous = readFile(LOG_FILE) or ""
+    writeFile(LOG_FILE, previous .. "[ALPM] " .. message .. "\n")
+end
+
+local function parseDescription(path)
+    local contents = readFile(path)
+    if not contents then
+        return nil
+    end
+
+    local result = {}
+    local current
+
+    for line in (contents .. "\n"):gmatch("(.-)\n") do
+        local section = line:match("^%%(.+)%%$")
+
+        if section then
+            current = section
+            result[current] = result[current] or {}
+        elseif line ~= "" and current then
+            result[current][#result[current] + 1] = line
+        end
+    end
+
+    return result
+end
+
+local function sectionValue(data, name, default)
+    if data and data[name] and data[name][1] then
+        return data[name][1]
+    end
+
+    return default
+end
+
+local function installedPackages()
+    local packages = {}
+
+    if not fs.exists(LOCAL_DB) then
+        return packages
+    end
+
+    for _, directory in ipairs(fs.list(LOCAL_DB)) do
+        local descPath = fs.combine(fs.combine(LOCAL_DB, directory), "desc")
+        local desc = parseDescription(descPath)
+
+        if desc then
+            local name = sectionValue(desc, "NAME")
+
+            if name then
+                packages[name] = {
+                    directory = directory,
+                    description = desc,
+                }
+            end
+        end
+    end
+
+    return packages
+end
+
+local function installed(name)
+    return installedPackages()[name]
+end
+
+local function loadRepository()
+    local contents = readFile(SYNC_DB)
+    if not contents then
+        return {
+            name = "core",
+            packages = {},
+        }
+    end
+
+    local repository = textutils.unserialize(contents)
+
+    if type(repository) ~= "table" then
+        error("invalid sync database", 0)
+    end
+
+    return repository
+end
+
+local function packageSize(pkg)
+    local size = 0
+
+    for _, contents in pairs(pkg.files or {}) do
+        size = size + #contents
+    end
+
+    return size
+end
+
+local function makeSection(name, values)
+    if values == nil then
+        return ""
+    end
+
+    if type(values) ~= "table" then
+        values = { tostring(values) }
+    end
+
+    if #values == 0 then
+        return ""
+    end
+
+    return "%" .. name .. "%\n" ..
+        table.concat(values, "\n") .. "\n\n"
+end
+
+local function removeOldDatabaseEntry(name)
+    local current = installed(name)
+
+    if current then
+        fs.delete(fs.combine(LOCAL_DB, current.directory))
+    end
+end
+
+local function writeInstalledDatabase(pkg, reason)
+    removeOldDatabaseEntry(pkg.name)
+
+    local directoryName = pkg.name .. "-" .. pkg.version
+    local directory = fs.combine(LOCAL_DB, directoryName)
+
+    mkdirp(directory)
+
+    local fileNames = {}
+    for path in pairs(pkg.files or {}) do
+        fileNames[#fileNames + 1] = path
+    end
+    table.sort(fileNames)
+
+    local desc =
+        makeSection("NAME", pkg.name) ..
+        makeSection("VERSION", pkg.version) ..
+        makeSection("BASE", pkg.base or pkg.name) ..
+        makeSection("DESC", pkg.description or "") ..
+        makeSection("URL", pkg.url or "https://archlinux.org/") ..
+        makeSection("ARCH", pkg.arch or "cc-lua") ..
+        makeSection("BUILDDATE", tostring(pkg.buildDate or 0)) ..
+        makeSection("INSTALLDATE", tostring(os.day())) ..
+        makeSection("PACKAGER", pkg.packager or "ArchCC Build System") ..
+        makeSection("SIZE", tostring(packageSize(pkg))) ..
+        makeSection("REASON", tostring(reason or 0)) ..
+        makeSection("VALIDATION", "None") ..
+        makeSection("DEPENDS", pkg.depends or {})
+
+    writeFile(fs.combine(directory, "desc"), desc)
+    writeFile(
+        fs.combine(directory, "files"),
+        makeSection("FILES", fileNames)
+    )
+end
+
+local function normaliseDependency(value)
+    return value:match("^([%w%+%-%._]+)")
+end
+
+local function installPackage(pkg, reason, repository, visiting)
+    visiting = visiting or {}
+
+    if visiting[pkg.name] then
+        error("dependency cycle involving " .. pkg.name, 0)
+    end
+
+    visiting[pkg.name] = true
+
+    for _, dependencyText in ipairs(pkg.depends or {}) do
+        local dependency = normaliseDependency(dependencyText)
+
+        if dependency and not installed(dependency) then
+            local dependencyPackage = repository.packages[dependency]
+
+            if not dependencyPackage then
+                error(
+                    "failed to prepare transaction (could not satisfy dependencies)\n" ..
+                    ":: unable to satisfy dependency '" .. dependency ..
+                    "' required by " .. pkg.name,
+                    0
+                )
+            end
+
+            print("resolving dependencies...")
+            installPackage(dependencyPackage, 1, repository, visiting)
+        end
+    end
+
+    visiting[pkg.name] = nil
+
+    for path, contents in pairs(pkg.files or {}) do
+        writeFile(path, contents)
+    end
+
+    writeInstalledDatabase(pkg, reason)
+    appendLog("installed " .. pkg.name .. " (" .. pkg.version .. ")")
+end
+
+local function removePackage(name)
+    local current = installed(name)
+
+    if not current then
+        printError("error: target not found: " .. name)
+        return false
+    end
+
+    if protectedPackages[name] then
+        printError("error: refusing to remove protected base package: " .. name)
+        return false
+    end
+
+    local directory = fs.combine(LOCAL_DB, current.directory)
+    local filesData = parseDescription(fs.combine(directory, "files"))
+
+    if filesData and filesData.FILES then
+        for _, path in ipairs(filesData.FILES) do
+            if fs.exists(path) and not fs.isDir(path) then
+                fs.delete(path)
+            end
+        end
+    end
+
+    fs.delete(directory)
+    appendLog("removed " .. name)
+
+    return true
+end
+
+local function packageInfo(pkg, repositoryName)
+    print("Repository      : " .. tostring(repositoryName or "local"))
+    print("Name            : " .. pkg.name)
+    print("Version         : " .. pkg.version)
+    print("Description     : " .. (pkg.description or ""))
+    print("Architecture    : " .. (pkg.arch or "cc-lua"))
+    print("URL             : " .. (pkg.url or "https://archlinux.org/"))
+    print("Licenses        : " .. table.concat(pkg.licenses or { "custom" }, " "))
+    print("Depends On      : " ..
+        (#(pkg.depends or {}) > 0 and table.concat(pkg.depends, " ") or "None"))
+    print("Installed Size  : " .. tostring(packageSize(pkg)) .. " B")
+    print("Packager        : " .. (pkg.packager or "ArchCC Build System"))
+end
+
+local function installedInfo(name)
+    local current = installed(name)
+
+    if not current then
+        printError("error: package '" .. name .. "' was not found")
+        return
+    end
+
+    local data = current.description
+
+    print("Name            : " .. sectionValue(data, "NAME", ""))
+    print("Version         : " .. sectionValue(data, "VERSION", ""))
+    print("Description     : " .. sectionValue(data, "DESC", ""))
+    print("Architecture    : " .. sectionValue(data, "ARCH", ""))
+    print("URL             : " .. sectionValue(data, "URL", ""))
+    print("Depends On      : " ..
+        (data.DEPENDS and table.concat(data.DEPENDS, " ") or "None"))
+    print("Install Reason  : " ..
+        (sectionValue(data, "REASON", "0") == "0"
+            and "Explicitly installed"
+            or "Installed as a dependency"))
+    print("Validated By    : " .. sectionValue(data, "VALIDATION", "None"))
+end
+
+local function optionPresent(letter)
+    for _, arg in ipairs(args) do
+        if arg:sub(1, 1) == "-" and arg:sub(1, 2) ~= "--" then
+            if arg:find(letter, 2, true) then
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+local function targets()
+    local result = {}
+
+    for _, arg in ipairs(args) do
+        if arg:sub(1, 1) ~= "-" then
+            result[#result + 1] = arg
+        end
+    end
+
+    return result
+end
+
+if #args == 0 then
+    print("usage: pacman <operation> [...]")
+    return
+end
+
+if args[1] == "-V" or args[1] == "--version" then
+    print("")
+    print(" .--.                  Pacman v1.0.0-archcc")
+    print("/ _.-' .-.  .-.  .-.  Lua-native package manager")
+    print("\\  '-. '-'  '-'  '-'  for ArchCC")
+    print(" '--'")
+    print("")
+    return
+end
+
+local operation
+
+if optionPresent("Q") then
+    operation = "query"
+elseif optionPresent("S") then
+    operation = "sync"
+elseif optionPresent("R") then
+    operation = "remove"
+elseif optionPresent("U") then
+    operation = "upgrade-file"
+end
+
+local requestedTargets = targets()
+
+if operation == "query" then
+    local packages = installedPackages()
+
+    if optionPresent("i") then
+        for _, name in ipairs(requestedTargets) do
+            installedInfo(name)
+        end
+
+    elseif optionPresent("l") then
+        for _, name in ipairs(requestedTargets) do
+            local current = packages[name]
+
+            if not current then
+                printError("error: package '" .. name .. "' was not found")
+            else
+                local directory = fs.combine(LOCAL_DB, current.directory)
+                local data = parseDescription(fs.combine(directory, "files"))
+
+                for _, path in ipairs((data and data.FILES) or {}) do
+                    print(name .. " /" .. path)
+                end
+            end
+        end
+
+    else
+        local names = {}
+        for name in pairs(packages) do
+            names[#names + 1] = name
+        end
+        table.sort(names)
+
+        for _, name in ipairs(names) do
+            print(
+                name .. " " ..
+                sectionValue(packages[name].description, "VERSION", "")
+            )
+        end
+    end
+
+elseif operation == "sync" then
+    local repository = loadRepository()
+
+    if optionPresent("s") then
+        local query = requestedTargets[1] or ""
+
+        for name, pkg in pairs(repository.packages) do
+            local searchable =
+                name:lower() .. " " ..
+                (pkg.description or ""):lower()
+
+            if searchable:find(query:lower(), 1, true) then
+                print("core/" .. name .. " " .. pkg.version)
+                print("    " .. (pkg.description or ""))
+            end
+        end
+
+    elseif optionPresent("i") then
+        for _, name in ipairs(requestedTargets) do
+            local pkg = repository.packages[name]
+
+            if not pkg then
+                printError("error: package '" .. name .. "' was not found")
+            else
+                packageInfo(pkg, repository.name)
+            end
+        end
+
+    elseif optionPresent("y") and #requestedTargets == 0 then
+        print(":: Synchronizing package databases...")
+        print(" core is up to date")
+
+        if optionPresent("u") then
+            print(":: Starting full system upgrade...")
+            print(" there is nothing to do")
+        end
+
+    else
+        local queue = {}
+        local totalSize = 0
+
+        for _, name in ipairs(requestedTargets) do
+            local pkg = repository.packages[name]
+
+            if not pkg then
+                printError("error: target not found: " .. name)
+                return
+            end
+
+            queue[#queue + 1] = pkg
+            totalSize = totalSize + packageSize(pkg)
+        end
+
+        if #queue == 0 then
+            printError("error: no targets specified")
+            return
+        end
+
+        print("resolving dependencies...")
+        print("looking for conflicting packages...")
+        print("")
+        print("Packages (" .. #queue .. ")")
+
+        for _, pkg in ipairs(queue) do
+            print("  " .. pkg.name .. "-" .. pkg.version)
+        end
+
+        print("")
+        print("Total Installed Size: " .. totalSize .. " B")
+        print("")
+        write(":: Proceed with installation? [Y/n] ")
+
+        local answer = read()
+        answer = (answer or ""):lower()
+
+        if answer ~= "" and answer ~= "y" and answer ~= "yes" then
+            print("installation aborted")
+            return
+        end
+
+        print("")
+        print(":: Processing package changes...")
+
+        for _, pkg in ipairs(queue) do
+            print("installing " .. pkg.name .. "...")
+            installPackage(pkg, 0, repository)
+        end
+    end
+
+elseif operation == "remove" then
+    if #requestedTargets == 0 then
+        printError("error: no targets specified")
+        return
+    end
+
+    print("checking dependencies...")
+    print("")
+    print("Packages (" .. #requestedTargets .. ") " ..
+        table.concat(requestedTargets, " "))
+    print("")
+    write(":: Do you want to remove these packages? [Y/n] ")
+
+    local answer = (read() or ""):lower()
+
+    if answer ~= "" and answer ~= "y" and answer ~= "yes" then
+        print("removal aborted")
+        return
+    end
+
+    for _, name in ipairs(requestedTargets) do
+        if removePackage(name) then
+            print("removing " .. name .. "...")
+        end
+    end
+
+elseif operation == "upgrade-file" then
+    for _, path in ipairs(requestedTargets) do
+        local contents = readFile(path)
+
+        if not contents then
+            printError("error: '" .. path .. "': could not open package")
+            return
+        end
+
+        local pkg = textutils.unserialize(contents)
+
+        if type(pkg) ~= "table" or not pkg.name or not pkg.version then
+            printError("error: '" .. path .. "': invalid package format")
+            return
+        end
+
+        installPackage(pkg, 0, loadRepository())
+    end
+
+else
+    printError("error: only -Q, -S, -R and -U are implemented")
+end
+]=])
+
+-- -------------------------------------------------------------------------
+-- Optional repository package: fastfetch
+-- -------------------------------------------------------------------------
+
+local fastfetchProgram = [=[local function readAll(path)
+    local handle = fs.open(path, "r")
+    if not handle then
+        return nil
+    end
+
+    local contents = handle.readAll()
+    handle.close()
+    return contents:gsub("%s+$", "")
+end
+
+local function formatTime(seconds)
+    seconds = math.floor(seconds)
+
+    local days = math.floor(seconds / 86400)
+    seconds = seconds % 86400
+
+    local hours = math.floor(seconds / 3600)
+    seconds = seconds % 3600
+
+    local minutes = math.floor(seconds / 60)
+
+    local result = {}
+
+    if days > 0 then
+        result[#result + 1] = days .. " day" .. (days == 1 and "" or "s")
+    end
+
+    if hours > 0 then
+        result[#result + 1] = hours .. " hour" .. (hours == 1 and "" or "s")
+    end
+
+    result[#result + 1] = minutes .. " min"
+
+    return table.concat(result, ", ")
+end
+
+local hostname = readAll("etc/hostname") or "archcc"
+local width, height = term.getSize()
+local free = fs.getFreeSpace("")
+local capacity = fs.getCapacity and fs.getCapacity("") or nil
+
+local logo = {
+    "       /\\       ",
+    "      /  \\      ",
+    "     /\\   \\     ",
+    "    /      \\    ",
+    "   /   ,,   \\   ",
+    "  /   |  |  -\\  ",
+    " /_-''    ''-_\\ ",
+}
+
+local info = {
+    "root@" .. hostname,
+    "-------------",
+    "OS: ArchCC Rolling",
+    "Host: CC:Tweaked/CraftOS-PC",
+    "Runtime: CraftOS Lua",
+    "Kernel: 0.1.0-archcc1",
+    "Uptime: " .. formatTime(os.clock()),
+    "Shell: archcc-shell 0.1.0",
+    "Terminal: " .. width .. "x" .. height,
+    "CPU: ComputerCraft Lua VM",
+    "Memory: managed by host runtime",
+    "Disk free: " .. tostring(free),
+    "Disk capacity: " .. tostring(capacity or "unknown"),
+}
+
+local lines = math.max(#logo, #info)
+
+for index = 1, lines do
+    local left = logo[index] or string.rep(" ", 17)
+    local right = info[index] or ""
+
+    if term.isColor and term.isColor() then
+        term.setTextColor(colors.lightBlue)
+    end
+
+    write(left .. "  ")
+
+    if term.isColor and term.isColor() then
+        term.setTextColor(colors.white)
+    end
+
+    print(right)
+end
+]=]
+
+local repository = {
+    name = "core",
+    generated = timestamp(),
+
+    packages = {
+        fastfetch = {
+            name = "fastfetch",
+            version = "0.1.0-1",
+            description = "System information display tool for ArchCC",
+            arch = "cc-lua",
+            url = "https://github.com/fastfetch-cli/fastfetch",
+            licenses = { "MIT" },
+            depends = { "archcc-release" },
+            packager = "ArchCC Build System",
+
+            files = {
+                ["usr/bin/fastfetch.lua"] = fastfetchProgram,
+            },
+        },
+
+        hello = {
+            name = "hello",
+            version = "1.0.0-1",
+            description = "A trivial greeting package for testing pacman",
+            arch = "cc-lua",
+            licenses = { "MIT" },
+            depends = {},
+
+            files = {
+                ["usr/bin/hello.lua"] =
+                    'print("Hello from the ArchCC package repository.")\n',
+            },
+        },
+    },
+}
+
+writeFile(
+    "var/lib/pacman/sync/core.db",
+    textutils.serialize(repository)
+)
+
+-- -------------------------------------------------------------------------
+-- Initial local ALPM-style package records
+-- -------------------------------------------------------------------------
+
+local function section(name, values)
+    if type(values) ~= "table" then
+        values = { tostring(values) }
+    end
+
+    if #values == 0 then
+        return ""
+    end
+
+    return "%" .. name .. "%\n" ..
+        table.concat(values, "\n") .. "\n\n"
+end
+
+local function registerInstalled(pkg)
+    local directory = fs.combine(
+        "var/lib/pacman/local",
+        pkg.name .. "-" .. pkg.version
+    )
+
+    mkdirp(directory)
+
+    local files = pkg.files or {}
+    table.sort(files)
+
+    local desc =
+        section("NAME", pkg.name) ..
+        section("VERSION", pkg.version) ..
+        section("BASE", pkg.name) ..
+        section("DESC", pkg.description) ..
+        section("URL", pkg.url or "https://archlinux.org/") ..
+        section("ARCH", "cc-lua") ..
+        section("BUILDDATE", tostring(timestamp())) ..
+        section("INSTALLDATE", tostring(timestamp())) ..
+        section("PACKAGER", "ArchCC Build System") ..
+        section("SIZE", "0") ..
+        section("REASON", "0") ..
+        section("VALIDATION", "None") ..
+        section("DEPENDS", pkg.depends or {})
+
+    writeFile(fs.combine(directory, "desc"), desc)
+    writeFile(fs.combine(directory, "files"), section("FILES", files))
+end
+
+registerInstalled({
+    name = "filesystem",
+    version = "2026.07-1",
+    description = "Base ArchCC filesystem",
+    files = {
+        "etc/fstab",
+        "etc/group",
+        "etc/hosts",
+        "etc/passwd",
+        "etc/shadow",
+        "etc/shells",
+    },
+})
+
+registerInstalled({
+    name = "archcc-release",
+    version = VERSION .. "-1",
+    description = "ArchCC release identification",
+    files = {
+        "etc/arch-release",
+        "etc/issue",
+        "etc/motd",
+        "etc/os-release",
+    },
+    depends = {
+        "filesystem",
+    },
+})
+
+registerInstalled({
+    name = "archcc-shell",
+    version = VERSION .. "-1",
+    description = "Interactive Arch-style shell for CraftOS",
+    files = {
+        "usr/bin/archcc-shell.lua",
+        "usr/bin/hostname.lua",
+        "usr/bin/id.lua",
+        "usr/bin/login.lua",
+        "usr/bin/uname.lua",
+        "usr/bin/whoami.lua",
+    },
+    depends = {
+        "filesystem",
+        "archcc-release",
+    },
+})
+
+registerInstalled({
+    name = "pacman",
+    version = "1.0.0-1",
+    description = "ArchCC package manager",
+    files = {
+        "etc/pacman.conf",
+        "etc/pacman.d/mirrorlist",
+        "usr/bin/pacman.lua",
+    },
+    depends = {
+        "filesystem",
+    },
+})
+
+registerInstalled({
+    name = "systemd-compat",
+    version = VERSION .. "-1",
+    description = "ArchCC service and target compatibility layer",
+    files = {
+        "usr/bin/systemctl.lua",
+        "usr/lib/systemd/system/getty@tty1.service",
+        "usr/lib/systemd/system/multi-user.target",
+    },
+    depends = {
+        "archcc-shell",
+    },
+})
+
+registerInstalled({
+    name = "base",
+    version = "1-1",
+    description = "Minimal package set defining an ArchCC installation",
+    files = {},
+    depends = {
+        "filesystem",
+        "archcc-release",
+        "archcc-shell",
+        "pacman",
+        "systemd-compat",
+    },
+})
+
+-- CraftOS boot bridge.
+writeFile("startup.lua", [=[-- ArchCC CraftOS boot bridge
+local ok = shell.run("usr/lib/archcc/init.lua")
+
+if not ok then
+    printError("ArchCC failed to start.")
+    print("The original startup file is stored as startup.craftos.bak.")
+    print("You are now in the CraftOS recovery shell.")
+end
+]=])
+
+print("")
+print("ArchCC " .. VERSION .. " installed successfully.")
+print("")
+print("Existing startup backup: /startup.craftos.bak")
+print("Boot entrypoint:          /startup.lua")
+print("Package database:         /var/lib/pacman")
+print("")
+print("Run 'reboot' to enter ArchCC.")
+print("Initial login: root")
+print("Initial password: leave blank and press Enter")
